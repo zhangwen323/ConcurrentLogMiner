@@ -2,9 +2,11 @@ package com.duke.concurrentminer;
 
 import java.io.*;
 import java.util.*;
+import java.util.concurrent.*;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
+import com.duke.concurrentminer.core.LogReader;
 import com.duke.concurrentminer.util.LogGenerator;
 
 /**
@@ -61,7 +63,7 @@ public class LogMinerApplication {
                 runBaseline(dir);
                 break;
             case "mine":
-                System.out.println("[Mine] Not implemented yet — coming in Phase 3+.");
+                runMine(dir, threads);
                 break;
             case "verify":
                 System.out.println("[Verify] Not implemented yet — coming in Phase 7.");
@@ -165,6 +167,103 @@ public class LogMinerApplication {
         }
         System.out.println();
         System.out.println("[Baseline] Results written to baseline_result.txt");
+    }
+
+    // ============================================================
+    // 多线程并发挖掘 (Phase 2: 生产者-消费者管道)
+    // ============================================================
+
+    /**
+     * 启动生产者-消费者管道:
+     *   生产者 = N 个 LogReader 线程 (每文件一个)
+     *   消费者 = 1 个简单消费者线程 (Phase 3 将升级为 ThreadPoolExecutor)
+     *   缓冲区  = ArrayBlockingQueue<String> (容量 10000)
+     */
+    static void runMine(String dirPath, int threads) throws Exception {
+        File dir = new File(dirPath);
+        File[] logFiles = dir.listFiles((d, name) -> name.endsWith(".log"));
+        if (logFiles == null || logFiles.length == 0) {
+            System.err.println("No .log files found in " + dir.getAbsolutePath());
+            return;
+        }
+
+        int readerCount = logFiles.length;
+        int consumerCount = threads; // 后续 Phase 3 使用，Phase 2 先用 1 个
+
+        // 中央有界阻塞队列 —— 容量硬限制 10000，满了自动阻塞生产者
+        ArrayBlockingQueue<String> queue = new ArrayBlockingQueue<>(10000);
+
+        System.out.println("=== Multi-Thread Producer-Consumer Pipeline ===");
+        System.out.printf("Files: %d | Queue Capacity: 10,000 | Consumers: %d (stub)%n",
+                readerCount, consumerCount);
+
+        long startTime = System.currentTimeMillis();
+
+        // ── 启动消费者线程 ──
+        // Phase 2: 简单单线程消费者，后续 Phase 3 升级为 ThreadPoolExecutor
+        // 使用数组传引用，在线程内更新 totalConsumed
+        final long[] totalConsumed = {0};
+
+        Thread consumer = new Thread(() -> {
+            String tName = Thread.currentThread().getName();
+            long consumed = 0;
+            long poisonReceived = 0;
+            long lastReport = System.currentTimeMillis();
+
+            try {
+                while (poisonReceived < readerCount) {
+                    String line = queue.take(); // 队列空时阻塞
+
+                    if (LogReader.POISON_PILL.equals(line)) {
+                        poisonReceived++;
+                        continue;
+                    }
+
+                    consumed++;
+
+                    // 每 1 秒输出队列状态
+                    long now = System.currentTimeMillis();
+                    if (now - lastReport >= 1000) {
+                        System.out.printf("[%s] Consumed: %,d | Queue: %,d/10,000 | Poison: %d/%d%n",
+                                tName, consumed, queue.size(),
+                                poisonReceived, readerCount);
+                        lastReport = now;
+                    }
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+
+            totalConsumed[0] = consumed;
+            System.out.printf("[%s] Consumer done: %,d lines consumed, %d poison pills received%n",
+                    tName, consumed, poisonReceived);
+        }, "Consumer-1");
+        consumer.start();
+
+        // ── 启动生产者线程 ──
+        ExecutorService readerPool = Executors.newFixedThreadPool(readerCount);
+        for (File file : logFiles) {
+            readerPool.execute(new LogReader(file, queue, 1)); // 每个 Reader 投 1 枚毒丸
+        }
+
+        // ── 等待生产者全部完成 ──
+        readerPool.shutdown();
+        readerPool.awaitTermination(30, TimeUnit.MINUTES);
+
+        // ── 等待消费者完成 ──
+        consumer.join();
+
+        long elapsed = System.currentTimeMillis() - startTime;
+        long lines = totalConsumed[0];
+
+        // Phase 2 报告 (先不打印 Level 统计，Phase 4 完善)
+        System.out.println();
+        System.out.println("========== Phase 2 Pipeline Results ==========");
+        System.out.printf("Total lines:      %,d%n", lines);
+        System.out.printf("Pipeline elapsed: %,d ms (%.2f sec)%n", elapsed, elapsed / 1000.0);
+        System.out.printf("Queue remaining:  %,d lines (should be 0)%n", queue.size());
+        System.out.printf("Throughput:       %,.0f lines/sec%n",
+                lines * 1000.0 / Math.max(elapsed, 1));
     }
 
     // ============================================================
