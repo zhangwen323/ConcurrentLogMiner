@@ -6,6 +6,7 @@ import java.util.concurrent.*;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
+import com.duke.concurrentminer.container.MetricsCollector;
 import com.duke.concurrentminer.core.LogParserPool;
 import com.duke.concurrentminer.core.LogReader;
 import com.duke.concurrentminer.util.LogGenerator;
@@ -177,7 +178,7 @@ public class LogMinerApplication {
     /**
      * 启动生产者-消费者管道:
      *   生产者 = N 个 LogReader 线程 (每文件一个)
-     *   消费者 = LogParserPool (动态线程池, 4 核心线程)
+     *   消费者 = LogParserPool (动态线程池) + MetricsCollector (无锁统计)
      *   缓冲区  = ArrayBlockingQueue<String> (容量 10000)
      */
     static void runMine(String dirPath, int threads) throws Exception {
@@ -192,22 +193,25 @@ public class LogMinerApplication {
         int corePoolSize = threads;
         int maxPoolSize = threads * 2;
 
-        // 中央有界阻塞队列 —— 容量硬限制 10000
+        // 中央有界阻塞队列
         ArrayBlockingQueue<String> queue = new ArrayBlockingQueue<>(10000);
 
-        System.out.println("=== Phase 3: ThreadPoolExecutor Pipeline ===");
-        System.out.printf("Files: %d | Queue Cap: 10,000 | Pool: core=%d / max=%d%n",
+        // 无锁统计容器 — Phase 4 新增
+        MetricsCollector metrics = new MetricsCollector();
+
+        System.out.println("=== Phase 4: Lock-Free Stats Pipeline ===");
+        System.out.printf("Files: %d | Queue: 10,000 | Pool: core=%d/max=%d | "
+                        + "Stats: ConcurrentHashMap + LongAdder%n",
                 readerCount, corePoolSize, maxPoolSize);
 
         long startTime = System.currentTimeMillis();
 
         // ── 启动消费者线程池 ──
         LogParserPool parserPool = new LogParserPool(
-                queue, readerCount, corePoolSize, maxPoolSize);
+                queue, readerCount, corePoolSize, maxPoolSize, metrics);
         parserPool.start();
 
         // ── 启动生产者线程 ──
-        // 每个 Reader 投 corePoolSize 枚毒丸 (每个 Parser 各一枚)
         ExecutorService readerPool = Executors.newFixedThreadPool(readerCount);
         for (File file : logFiles) {
             readerPool.execute(new LogReader(file, queue, corePoolSize));
@@ -218,21 +222,39 @@ public class LogMinerApplication {
         readerPool.awaitTermination(30, TimeUnit.MINUTES);
 
         // ── 优雅关闭消费者线程池 ──
-        // shutdown() 不会中断正在运行的任务，Parser 继续处理直至收到所有毒丸
         parserPool.shutdownAndAwait(60);
 
         long elapsed = System.currentTimeMillis() - startTime;
         long lines = parserPool.getParsedCount();
-
-        // Phase 3 报告
-        System.out.println();
-        System.out.println("========== Phase 3 Pipeline Results ==========");
-        System.out.printf("Total lines:      %,d%n", lines);
-        System.out.printf("Pipeline elapsed: %,d ms (%.2f sec)%n", elapsed, elapsed / 1000.0);
-        System.out.printf("Queue remaining:  %,d (should be 0)%n", queue.size());
+        long errors = parserPool.getParseErrors();
+        double seconds = elapsed / 1000.0;
         double throughput = lines * 1000.0 / Math.max(elapsed, 1);
+
+        // ── Phase 4 报告 ──
+        System.out.println();
+        System.out.println("========== Phase 4 Pipeline Results ==========");
+        System.out.printf("Total lines:      %,d%n", lines);
+        System.out.printf("Parse errors:     %,d%n", errors);
+        System.out.printf("Pipeline elapsed: %,d ms (%.2f sec)%n", elapsed, seconds);
+        System.out.printf("Queue remaining:  %,d (should be 0)%n", queue.size());
         System.out.printf("Throughput:       %,.0f lines/sec%n", throughput);
         System.out.printf("Parser threads:   %d%n", corePoolSize);
+
+        // ── Level 分布 ──
+        Map<String, Long> levelSnap = metrics.getLevelSnapshot();
+        System.out.println();
+        System.out.println("--- Level Distribution (Lock-Free) ---");
+        for (Map.Entry<String, Long> e : levelSnap.entrySet()) {
+            double pct = lines > 0 ? 100.0 * e.getValue() / lines : 0;
+            System.out.printf("  %-5s: %,12d  (%5.2f%%)%n", e.getKey(), e.getValue(), pct);
+        }
+
+        // ── Top 10 Hot IPs ──
+        System.out.println();
+        System.out.println("--- Top 10 Hot IPs (Heap-Selected) ---");
+        for (Map.Entry<String, Long> e : metrics.getTopNIPs(10)) {
+            System.out.printf("  %-15s  %,12d%n", e.getKey(), e.getValue());
+        }
     }
 
     // ============================================================

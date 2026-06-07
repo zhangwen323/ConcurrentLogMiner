@@ -1,7 +1,12 @@
 package com.duke.concurrentminer.core;
 
+import com.duke.concurrentminer.container.MetricsCollector;
+
+import java.util.Map;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * 日志解析线程池（消费者）。
@@ -31,12 +36,19 @@ public class LogParserPool {
     public static final long DEFAULT_KEEP_ALIVE_SEC = 60;
     public static final int DEFAULT_POOL_QUEUE_CAP = 2000;
 
+    /** 日志行解析正则: "Timestamp | Level | IP | Message" */
+    private static final Pattern LOG_PATTERN =
+            Pattern.compile("^(.+?) \\| (.+?) \\| (.+?) \\| (.+)$");
+
     private final ThreadPoolExecutor pool;
     private final ArrayBlockingQueue<String> sourceQueue;  // 中央日志队列
     private final int readerCount;                          // 生产者数量 (用于毒丸计数)
+    private final MetricsCollector metrics;                  // 无锁统计容器
 
     /** 已解析行数（用于 Monitor 展示） */
     private final AtomicLong parsedCount = new AtomicLong(0);
+    /** 解析失败行数 */
+    private final AtomicLong parseErrors = new AtomicLong(0);
 
     private Thread monitorThread;
 
@@ -45,13 +57,16 @@ public class LogParserPool {
      * @param readerCount LogReader 线程数量
      * @param corePoolSize 核心线程数
      * @param maxPoolSize  最大线程数
+     * @param metrics      无锁统计容器
      */
     public LogParserPool(ArrayBlockingQueue<String> sourceQueue,
                          int readerCount,
                          int corePoolSize,
-                         int maxPoolSize) {
+                         int maxPoolSize,
+                         MetricsCollector metrics) {
         this.sourceQueue = sourceQueue;
         this.readerCount = readerCount;
+        this.metrics = metrics;
 
         // 手动构造 ThreadPoolExecutor —— 学习重点！
         this.pool = new ThreadPoolExecutor(
@@ -128,6 +143,20 @@ public class LogParserPool {
         return parsedCount.get();
     }
 
+    /**
+     * 获取解析错误数。
+     */
+    public long getParseErrors() {
+        return parseErrors.get();
+    }
+
+    /**
+     * 获取统计容器引用（用于最终报告）。
+     */
+    public MetricsCollector getMetrics() {
+        return metrics;
+    }
+
     // ================================================================
     // Parser 工作线程
     // ================================================================
@@ -136,7 +165,10 @@ public class LogParserPool {
      * 每个 ParserWorker 是一个长期运行的任务，循环从中央队列 take() 日志行，
      * 直到收到足够数量的毒丸后退出。
      *
-     * Phase 3 只做计数，Phase 4 将集成 MetricsCollector 进行无锁统计。
+     * 每条日志进行正则解析，然后通过 MetricsCollector 无锁累加统计。
+     *
+     * 性能注意: regex 解析是 CPU 密集型操作，是当前管道的最大瓶颈。
+     * ConcurrentHashMap + LongAdder 的组合确保了统计部分不会成为瓶颈。
      */
     class ParserWorker implements Runnable {
         private final int id;
@@ -148,10 +180,10 @@ public class LogParserPool {
         @Override
         public void run() {
             long consumed = 0;
+            long errors = 0;
             int poisonReceived = 0;
 
             try {
-                // 每个 Parser 在收到 readerCount 枚毒丸后退出
                 while (poisonReceived < readerCount) {
                     String line = sourceQueue.take(); // 队列空时阻塞
 
@@ -160,7 +192,18 @@ public class LogParserPool {
                         continue;
                     }
 
-                    // Phase 3: 仅计数，Phase 4 在此处集成 MetricsCollector
+                    // ── 正则解析 + 无锁统计 ──
+                    Matcher m = LOG_PATTERN.matcher(line);
+                    if (m.matches()) {
+                        String level = m.group(2).trim();
+                        String ip = m.group(3).trim();
+                        // 无锁原子累加 — 学习重点
+                        metrics.incrementLevel(level);
+                        metrics.incrementIP(ip);
+                    } else {
+                        errors++;
+                    }
+
                     consumed++;
                     parsedCount.incrementAndGet();
                 }
@@ -168,8 +211,10 @@ public class LogParserPool {
                 Thread.currentThread().interrupt();
             }
 
-            System.out.printf("[Parser-%d] Done: %,d lines consumed, %d poison pills received%n",
-                    id, consumed, poisonReceived);
+            parseErrors.addAndGet(errors);
+            System.out.printf("[Parser-%d] Done: %,d lines consumed, "
+                            + "%d errors, %d poison pills received%n",
+                    id, consumed, errors, poisonReceived);
         }
     }
 
@@ -214,6 +259,17 @@ public class LogParserPool {
                         sourceQueue.size() + sourceQueue.remainingCapacity(),
                         parsedCount.get(),
                         pool.getCompletedTaskCount()
+                );
+                // 每秒额外打印 Level 分布概览
+                Map<String, Long> snap = metrics.getLevelSnapshot();
+                System.out.printf(
+                        "[Monitor]   Levels: INFO=%,d WARN=%,d ERROR=%,d DEBUG=%,d FATAL=%,d | parseErr=%,d%n",
+                        snap.getOrDefault("INFO", 0L),
+                        snap.getOrDefault("WARN", 0L),
+                        snap.getOrDefault("ERROR", 0L),
+                        snap.getOrDefault("DEBUG", 0L),
+                        snap.getOrDefault("FATAL", 0L),
+                        parseErrors.get()
                 );
             }
         }
