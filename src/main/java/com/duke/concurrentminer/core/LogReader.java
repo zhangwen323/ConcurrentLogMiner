@@ -49,7 +49,6 @@ public class LogReader implements Runnable {
     public void run() {
         String threadName = Thread.currentThread().getName();
         long lineCount = 0;
-        long blockedCount = 0;
 
         try (BufferedReader reader = new BufferedReader(
                 new FileReader(logFile), 256 * 1024)) {  // 256KB 读缓冲区
