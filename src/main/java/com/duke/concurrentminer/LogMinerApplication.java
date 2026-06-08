@@ -7,6 +7,7 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 import com.duke.concurrentminer.container.MetricsCollector;
+import com.duke.concurrentminer.core.AsyncAlertManager;
 import com.duke.concurrentminer.core.LogParserPool;
 import com.duke.concurrentminer.core.LogReader;
 import com.duke.concurrentminer.util.LogGenerator;
@@ -196,10 +197,13 @@ public class LogMinerApplication {
         // 中央有界阻塞队列
         ArrayBlockingQueue<String> queue = new ArrayBlockingQueue<>(10000);
 
-        // 无锁统计容器 — Phase 4 新增
+        // 无锁统计容器
         MetricsCollector metrics = new MetricsCollector();
 
-        System.out.println("=== Phase 4: Lock-Free Stats Pipeline ===");
+        // 异步告警编排器 — Phase 5 新增
+        AsyncAlertManager alertManager = new AsyncAlertManager();
+
+        System.out.println("=== Phase 5: Async Alert Chain Pipeline ===");
         System.out.printf("Files: %d | Queue: 10,000 | Pool: core=%d/max=%d | "
                         + "Stats: ConcurrentHashMap + LongAdder%n",
                 readerCount, corePoolSize, maxPoolSize);
@@ -208,7 +212,7 @@ public class LogMinerApplication {
 
         // ── 启动消费者线程池 ──
         LogParserPool parserPool = new LogParserPool(
-                queue, readerCount, corePoolSize, maxPoolSize, metrics);
+                queue, readerCount, corePoolSize, maxPoolSize, metrics, alertManager);
         parserPool.start();
 
         // ── 启动生产者线程 ──
@@ -239,6 +243,8 @@ public class LogMinerApplication {
         System.out.printf("Queue remaining:  %,d (should be 0)%n", queue.size());
         System.out.printf("Throughput:       %,.0f lines/sec%n", throughput);
         System.out.printf("Parser threads:   %d%n", corePoolSize);
+        System.out.printf("Async alerts:     %,d (CompletableFuture chain)%n",
+                alertManager.getAlertCount());
 
         // ── Level 分布 ──
         Map<String, Long> levelSnap = metrics.getLevelSnapshot();

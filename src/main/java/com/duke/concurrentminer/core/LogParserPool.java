@@ -44,6 +44,7 @@ public class LogParserPool {
     private final ArrayBlockingQueue<String> sourceQueue;  // 中央日志队列
     private final int readerCount;                          // 生产者数量 (用于毒丸计数)
     private final MetricsCollector metrics;                  // 无锁统计容器
+    private final AsyncAlertManager alertManager;            // 异步告警编排器
 
     /** 已解析行数（用于 Monitor 展示） */
     private final AtomicLong parsedCount = new AtomicLong(0);
@@ -53,20 +54,23 @@ public class LogParserPool {
     private Thread monitorThread;
 
     /**
-     * @param sourceQueue 中央有界阻塞队列 (LogReader → this)
-     * @param readerCount LogReader 线程数量
+     * @param sourceQueue  中央有界阻塞队列 (LogReader → this)
+     * @param readerCount  LogReader 线程数量
      * @param corePoolSize 核心线程数
      * @param maxPoolSize  最大线程数
      * @param metrics      无锁统计容器
+     * @param alertManager 异步告警编排器 (null = 禁用告警)
      */
     public LogParserPool(ArrayBlockingQueue<String> sourceQueue,
                          int readerCount,
                          int corePoolSize,
                          int maxPoolSize,
-                         MetricsCollector metrics) {
+                         MetricsCollector metrics,
+                         AsyncAlertManager alertManager) {
         this.sourceQueue = sourceQueue;
         this.readerCount = readerCount;
         this.metrics = metrics;
+        this.alertManager = alertManager;
 
         // 手动构造 ThreadPoolExecutor —— 学习重点！
         this.pool = new ThreadPoolExecutor(
@@ -134,6 +138,11 @@ public class LogParserPool {
 
         System.out.printf("[LogParserPool] Terminated. Final: parsed=%,d, completedTasks=%d%n",
                 parsedCount.get(), pool.getCompletedTaskCount());
+
+        // 关闭异步告警管理器
+        if (alertManager != null) {
+            alertManager.shutdown();
+        }
     }
 
     /**
@@ -197,9 +206,15 @@ public class LogParserPool {
                     if (m.matches()) {
                         String level = m.group(2).trim();
                         String ip = m.group(3).trim();
-                        // 无锁原子累加 — 学习重点
+                        String msg = m.group(4).trim();
+                        // 无锁原子累加
                         metrics.incrementLevel(level);
                         metrics.incrementIP(ip);
+
+                        // ERROR 级别 → 触发异步告警链 (不阻塞主解析)
+                        if ("ERROR".equals(level) && alertManager != null) {
+                            alertManager.handleError(line, ip, msg);
+                        }
                     } else {
                         errors++;
                     }
