@@ -249,25 +249,30 @@ public class LogParserPool {
                     long current = parsedCount.incrementAndGet();
 
                     // ── CyclicBarrier 对账关卡 ──
-                    // 当解析总量达到 nextCheckpoint 时，触发全线程同步
-                    if (current >= nextCheckpoint && !checkpointActive) {
+                    // 只在正常处理期间触发 (收到足够毒丸即将退出时，跳过对账)
+                    boolean exiting = poisonReceived >= readerCount;
+                    if (!exiting && current >= nextCheckpoint && !checkpointActive) {
                         synchronized (checkpointLock) {
-                            if (current >= nextCheckpoint && !checkpointActive) {
+                            if (!exiting && current >= nextCheckpoint && !checkpointActive) {
                                 checkpointActive = true;
                                 System.out.printf("[Parser-%d] Checkpoint triggered at %,d lines%n",
                                         id, current);
                             }
                         }
                     }
-                    if (checkpointActive) {
+                    if (checkpointActive && !exiting) {
                         try {
-                            // 所有核心线程在此等待，直到最后到达者执行 barrier action
-                            barrier.await();
+                            // 所有核心线程在此等待，超时 2s 则放弃本次对账
+                            barrier.await(2, TimeUnit.SECONDS);
                             // barrier 成功后 checkpointActive 已被 action 重置
+                        } catch (TimeoutException e) {
+                            System.err.printf("[Parser-%d] Checkpoint timeout, skipping...%n", id);
+                            barrier.reset();
+                            checkpointActive = false;
                         } catch (BrokenBarrierException e) {
                             System.err.printf("[Parser-%d] Barrier broken: %s%n",
                                     id, e.getMessage());
-                            checkpointActive = false; // 清理状态
+                            checkpointActive = false;
                         }
                     }
                 }

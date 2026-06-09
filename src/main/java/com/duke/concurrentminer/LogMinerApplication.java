@@ -69,7 +69,7 @@ public class LogMinerApplication {
                 runMine(dir, threads);
                 break;
             case "verify":
-                System.out.println("[Verify] Not implemented yet — coming in Phase 7.");
+                runVerify(dir, threads);
                 break;
             default:
                 System.err.println("Unknown mode: " + mode);
@@ -265,8 +265,179 @@ public class LogMinerApplication {
     }
 
     // ============================================================
+    // 对账验证 (Phase 7)
+    // ============================================================
+
+    /**
+     * 单线程 vs 多线程对账验证。
+     *
+     * 红线指标: 多线程统计结果必须与单线程串行结果 100% 一致。
+     * 任何差异都意味着并发数据结构使用不当。
+     */
+    static void runVerify(String dirPath, int threads) throws Exception {
+        File dir = new File(dirPath);
+        File[] logFiles = dir.listFiles((d, name) -> name.endsWith(".log"));
+        if (logFiles == null || logFiles.length == 0) {
+            System.err.println("No .log files found in " + dir.getAbsolutePath());
+            return;
+        }
+
+        System.out.println("╔══════════════════════════════════════════════╗");
+        System.out.println("║   Phase 7: Reconciliation Verification      ║");
+        System.out.println("║   Single-Thread  vs  Multi-Thread (JUC)      ║");
+        System.out.println("╚══════════════════════════════════════════════╝");
+        System.out.println();
+
+        // ── Step 1: 单线程串行扫描 ──
+        System.out.println("─── Step 1/3: Single-Thread Scan ───");
+        long stStart = System.currentTimeMillis();
+        MetricsCollector singleMetrics = countSingleThreaded(dir, logFiles);
+        long stElapsed = System.currentTimeMillis() - stStart;
+        Map<String, Long> stLevels = singleMetrics.getLevelSnapshot();
+        long stTotal = singleMetrics.getTotalLevelCount();
+
+        System.out.printf("  Single-thread: %,d lines in %,d ms (%,.0f lines/sec)%n%n",
+                stTotal, stElapsed, stTotal * 1000.0 / Math.max(stElapsed, 1));
+
+        // ── Step 2: 多线程并发管道 ──
+        System.out.println("─── Step 2/3: Multi-Thread Pipeline ───");
+        long mtStart = System.currentTimeMillis();
+
+        ArrayBlockingQueue<String> queue = new ArrayBlockingQueue<>(10000);
+        MetricsCollector multiMetrics = new MetricsCollector();
+        int readerCount = logFiles.length;
+        int corePoolSize = threads;
+
+        LogParserPool parserPool = new LogParserPool(
+                queue, readerCount, corePoolSize, threads * 2,
+                multiMetrics, null, "snapshots", 1_000_000); // 对账模式跳过异步告警
+        parserPool.start();
+
+        ExecutorService readerPool = Executors.newFixedThreadPool(readerCount);
+        for (File file : logFiles) {
+            readerPool.execute(new LogReader(file, queue, corePoolSize));
+        }
+        readerPool.shutdown();
+        readerPool.awaitTermination(30, TimeUnit.MINUTES);
+        parserPool.shutdownAndAwait(60);
+
+        long mtElapsed = System.currentTimeMillis() - mtStart;
+        Map<String, Long> mtLevels = multiMetrics.getLevelSnapshot();
+        long mtTotal = parserPool.getParsedCount();
+        long mtErrors = parserPool.getParseErrors();
+
+        System.out.printf("  Multi-thread:  %,d lines in %,d ms (%,.0f lines/sec)%n",
+                mtTotal, mtElapsed, mtTotal * 1000.0 / Math.max(mtElapsed, 1));
+        System.out.println();
+
+        // ── Step 3: 逐项对账 ──
+        System.out.println("─── Step 3/3: Reconciliation ───");
+        System.out.println();
+
+        boolean allMatch = true;
+        int mismatches = 0;
+
+        // ── 对账: Level 分布 ──
+        System.out.println("─── Level Distribution " + repeatChar('─', 35));
+        System.out.printf("│ %-8s  %15s  %15s  %10s%n",
+                "Level", "Single-Thread", "Multi-Thread", "Status");
+        System.out.println("├" + repeatChar('─', 55));
+
+        for (String lv : new String[]{"INFO", "WARN", "ERROR", "DEBUG", "FATAL"}) {
+            long stVal = stLevels.getOrDefault(lv, 0L);
+            long mtVal = mtLevels.getOrDefault(lv, 0L);
+            boolean match = stVal == mtVal;
+            if (!match) { allMatch = false; mismatches++; }
+            System.out.printf("│ %-8s  %,15d  %,15d  %s%n",
+                    lv, stVal, mtVal, match ? "✅" : "❌ DIFF=" + (mtVal - stVal));
+        }
+        System.out.println("└" + repeatChar('─', 55));
+        System.out.println();
+
+        // ── 对账: 总行数 ──
+        System.out.printf("Total lines:   ST=%,d  MT=%,d  %s%n",
+                stTotal, mtTotal, stTotal == mtTotal ? "✅" : "❌");
+        System.out.printf("Parse errors:  ST=0  MT=%,d  %s%n",
+                mtErrors, mtErrors == 0 ? "✅" : "⚠️");
+        System.out.println();
+
+        // ── 对账: Top-10 IP ──
+        System.out.println("┌─ Top-10 IP Overlap " + repeatChar('─', 44));
+        List<Map.Entry<String, Long>> stTop = singleMetrics.getTopNIPs(10);
+        List<Map.Entry<String, Long>> mtTop = multiMetrics.getTopNIPs(10);
+
+        Set<String> stIPs = new HashSet<>();
+        for (Map.Entry<String, Long> e : stTop) stIPs.add(e.getKey());
+        int overlap = 0;
+        for (Map.Entry<String, Long> e : mtTop) {
+            if (stIPs.contains(e.getKey())) overlap++;
+        }
+        System.out.printf("│ Top-10 overlap: %d/10%n", overlap);
+        System.out.println("└" + repeatChar('─', 55));
+        System.out.println();
+
+        // ── 性能对比 ──
+        double speedup = (double) stElapsed / Math.max(mtElapsed, 1);
+        System.out.println("┌─ Performance " + repeatChar('─', 48));
+        System.out.printf("│ Single-thread:  %,6d ms  (%,.0f lines/sec)%n",
+                stElapsed, stTotal * 1000.0 / Math.max(stElapsed, 1));
+        System.out.printf("│ Multi-thread:   %,6d ms  (%,.0f lines/sec)%n",
+                mtElapsed, mtTotal * 1000.0 / Math.max(mtElapsed, 1));
+        System.out.printf("│ Speedup:        %.2fx%n", speedup);
+        System.out.println("└" + repeatChar('─', 55));
+        System.out.println();
+
+        // ── Snapshot 验证 ──
+        File snapDir = new File("snapshots");
+        File[] snaps = snapDir.listFiles((d, n) -> n.endsWith(".txt"));
+        int snapCount = snaps != null ? snaps.length : 0;
+        int expectedSnaps = (int) (mtTotal / 1_000_000);
+        System.out.printf("Checkpoints: %d snapshot(s) found (expected ~%d)%n",
+                snapCount, expectedSnaps);
+
+        // ── 最终裁决 ──
+        System.out.println();
+        System.out.println("╔══════════════════════════════════════════════╗");
+        if (allMatch && mtErrors == 0) {
+            System.out.println("║  🏆 VERDICT: ALL CLEAR — 100% Consistent    ║");
+        } else {
+            System.out.println("║  ❌ VERDICT: DATA DRIFT DETECTED             ║");
+            System.out.printf("║  Mismatches: %d                              ║%n", mismatches);
+        }
+        System.out.println("╚══════════════════════════════════════════════╝");
+    }
+
+    /**
+     * 单线程扫描，使用 MetricsCollector 收集统计（与多线程用同一数据结构）。
+     */
+    static MetricsCollector countSingleThreaded(File dir, File[] logFiles) throws IOException {
+        MetricsCollector mc = new MetricsCollector();
+
+        for (File file : logFiles) {
+            try (BufferedReader reader = new BufferedReader(
+                    new FileReader(file), 256 * 1024)) {
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    Matcher m = LOG_PATTERN.matcher(line);
+                    if (m.matches()) {
+                        mc.incrementLevel(m.group(2).trim());
+                        mc.incrementIP(m.group(3).trim());
+                    }
+                }
+            }
+        }
+        return mc;
+    }
+
+    // ============================================================
     // 工具方法
     // ============================================================
+
+    static String repeatChar(char c, int count) {
+        char[] chars = new char[count];
+        Arrays.fill(chars, c);
+        return new String(chars);
+    }
 
     static void printHelp() {
         System.out.println("ConcurrentLogMiner — 高性能多线程日志分析与检索系统");
