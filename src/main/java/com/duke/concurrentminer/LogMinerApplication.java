@@ -212,7 +212,8 @@ public class LogMinerApplication {
 
         // ── 启动消费者线程池 ──
         LogParserPool parserPool = new LogParserPool(
-                queue, readerCount, corePoolSize, maxPoolSize, metrics, alertManager);
+                queue, readerCount, corePoolSize, maxPoolSize, metrics, alertManager,
+                "snapshots", 1_000_000);
         parserPool.start();
 
         // ── 启动生产者线程 ──

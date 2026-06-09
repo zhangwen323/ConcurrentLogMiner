@@ -124,6 +124,44 @@ public class MetricsCollector {
     }
 
     /**
+     * 将当前统计快照写入文件。
+     *
+     * 由 CyclicBarrier 的 barrier action 调用（最后一个到达屏障的线程执行）。
+     * 读取 LongAdder.sum() 是线程安全的，但多个 LongAdder 之间不保证原子性 —
+     * 这对 checkpoint 快照是可接受的（允许微小偏差）。
+     */
+    public void writeSnapshot(String outputDir, long checkpointAt) {
+        java.io.File dir = new java.io.File(outputDir);
+        if (!dir.exists()) dir.mkdirs();
+
+        String filename = String.format("%s/snapshot_%07d.txt", outputDir, checkpointAt);
+        try (java.io.PrintWriter pw = new java.io.PrintWriter(
+                new java.io.FileWriter(filename))) {
+
+            pw.printf("=== Snapshot at %,d lines ===%n", checkpointAt);
+            pw.printf("Time: %s%n", new java.util.Date());
+            pw.println();
+
+            // Level 分布
+            pw.println("Level Distribution:");
+            Map<String, Long> levels = getLevelSnapshot();
+            for (Map.Entry<String, Long> e : levels.entrySet()) {
+                pw.printf("  %-5s: %,d%n", e.getKey(), e.getValue());
+            }
+            pw.println();
+
+            // Top 10 IPs
+            pw.println("Top 10 Hot IPs:");
+            for (Map.Entry<String, Long> e : getTopNIPs(10)) {
+                pw.printf("  %-15s  %,d%n", e.getKey(), e.getValue());
+            }
+
+        } catch (java.io.IOException e) {
+            System.err.printf("[Snapshot] Failed to write %s: %s%n", filename, e.getMessage());
+        }
+    }
+
+    /**
      * 重置所有计数器（用于多次测试）。
      */
     public void reset() {

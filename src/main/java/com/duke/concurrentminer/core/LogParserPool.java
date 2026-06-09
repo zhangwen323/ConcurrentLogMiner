@@ -36,6 +36,9 @@ public class LogParserPool {
     public static final long DEFAULT_KEEP_ALIVE_SEC = 60;
     public static final int DEFAULT_POOL_QUEUE_CAP = 2000;
 
+    /** 每 N 行触发一次对账 checkpoint (可通过构造函数配置) */
+    private final long checkpointInterval;
+
     /** 日志行解析正则: "Timestamp | Level | IP | Message" */
     private static final Pattern LOG_PATTERN =
             Pattern.compile("^(.+?) \\| (.+?) \\| (.+?) \\| (.+)$");
@@ -45,32 +48,46 @@ public class LogParserPool {
     private final int readerCount;                          // 生产者数量 (用于毒丸计数)
     private final MetricsCollector metrics;                  // 无锁统计容器
     private final AsyncAlertManager alertManager;            // 异步告警编排器
+    private final String snapshotDir;                         // 快照输出目录
 
     /** 已解析行数（用于 Monitor 展示） */
     private final AtomicLong parsedCount = new AtomicLong(0);
     /** 解析失败行数 */
     private final AtomicLong parseErrors = new AtomicLong(0);
 
+    // ── CyclicBarrier 对账关卡 ──
+    private final CyclicBarrier barrier;
+    private final Object checkpointLock = new Object();
+    private volatile boolean checkpointActive = false;
+    private volatile long nextCheckpoint;
+
     private Thread monitorThread;
 
     /**
-     * @param sourceQueue  中央有界阻塞队列 (LogReader → this)
-     * @param readerCount  LogReader 线程数量
-     * @param corePoolSize 核心线程数
-     * @param maxPoolSize  最大线程数
-     * @param metrics      无锁统计容器
-     * @param alertManager 异步告警编排器 (null = 禁用告警)
+     * @param sourceQueue       中央有界阻塞队列 (LogReader → this)
+     * @param readerCount       LogReader 线程数量
+     * @param corePoolSize      核心线程数 (也是 CyclicBarrier 的 parties 数)
+     * @param maxPoolSize       最大线程数
+     * @param metrics           无锁统计容器
+     * @param alertManager      异步告警编排器 (null = 禁用告警)
+     * @param snapshotDir       对账快照输出目录
+     * @param checkpointInterval 对账间隔（行数）
      */
     public LogParserPool(ArrayBlockingQueue<String> sourceQueue,
                          int readerCount,
                          int corePoolSize,
                          int maxPoolSize,
                          MetricsCollector metrics,
-                         AsyncAlertManager alertManager) {
+                         AsyncAlertManager alertManager,
+                         String snapshotDir,
+                         long checkpointInterval) {
         this.sourceQueue = sourceQueue;
         this.readerCount = readerCount;
         this.metrics = metrics;
         this.alertManager = alertManager;
+        this.snapshotDir = snapshotDir;
+        this.checkpointInterval = checkpointInterval;
+        this.nextCheckpoint = checkpointInterval;
 
         // 手动构造 ThreadPoolExecutor —— 学习重点！
         this.pool = new ThreadPoolExecutor(
@@ -81,6 +98,15 @@ public class LogParserPool {
                 new ThreadPoolExecutor.CallerRunsPolicy()
                 // ↑ 队列满 + 线程满时，由提交任务的线程直接执行 → 天然限流
         );
+
+        // CyclicBarrier: parties=corePoolSize, barrier action 由最后到达的线程执行
+        // 写入快照后自动重置 — 支持循环复用
+        this.barrier = new CyclicBarrier(corePoolSize, () -> {
+            metrics.writeSnapshot(snapshotDir, nextCheckpoint);
+            System.out.printf("[Checkpoint] Snapshot written at %,d lines%n", nextCheckpoint);
+            nextCheckpoint += checkpointInterval;
+            checkpointActive = false;
+        });
     }
 
     /**
@@ -220,7 +246,30 @@ public class LogParserPool {
                     }
 
                     consumed++;
-                    parsedCount.incrementAndGet();
+                    long current = parsedCount.incrementAndGet();
+
+                    // ── CyclicBarrier 对账关卡 ──
+                    // 当解析总量达到 nextCheckpoint 时，触发全线程同步
+                    if (current >= nextCheckpoint && !checkpointActive) {
+                        synchronized (checkpointLock) {
+                            if (current >= nextCheckpoint && !checkpointActive) {
+                                checkpointActive = true;
+                                System.out.printf("[Parser-%d] Checkpoint triggered at %,d lines%n",
+                                        id, current);
+                            }
+                        }
+                    }
+                    if (checkpointActive) {
+                        try {
+                            // 所有核心线程在此等待，直到最后到达者执行 barrier action
+                            barrier.await();
+                            // barrier 成功后 checkpointActive 已被 action 重置
+                        } catch (BrokenBarrierException e) {
+                            System.err.printf("[Parser-%d] Barrier broken: %s%n",
+                                    id, e.getMessage());
+                            checkpointActive = false; // 清理状态
+                        }
+                    }
                 }
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
